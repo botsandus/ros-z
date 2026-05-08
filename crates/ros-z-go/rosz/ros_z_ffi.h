@@ -124,6 +124,21 @@ typedef struct ros_z_topic_info_t {
 } ros_z_topic_info_t;
 
 /**
+ * Topic info plus the first observed publisher's QoS. QoS-related fields
+ * are only meaningful when pub_count > 0; sentinel -1 means no publisher
+ * was visible. Encoding matches ros_z_qos_profile_t.
+ */
+typedef struct ros_z_topic_info_with_qos_t {
+  char *name;
+  char *type_name;
+  int32_t pub_count;
+  int32_t pub_reliability;
+  int32_t pub_durability;
+  int32_t pub_history;
+  int32_t pub_history_depth;
+} ros_z_topic_info_with_qos_t;
+
+/**
  * Node info returned to FFI callers
  */
 typedef struct ros_z_node_info_t {
@@ -222,6 +237,18 @@ int32_t ros_z_graph_get_topic_names_and_types(struct ros_z_context_t *ctx,
  * Free topic info array
  */
 void ros_z_graph_free_topics(struct ros_z_topic_info_t *topics, uintptr_t count);
+
+/**
+ * Get all topic names and types, plus the first observed publisher's QoS.
+ */
+int32_t ros_z_graph_get_topics_with_publisher_qos(struct ros_z_context_t *ctx,
+                                                  struct ros_z_topic_info_with_qos_t **out_topics,
+                                                  uintptr_t *out_count);
+
+/**
+ * Free topic-with-QoS info array.
+ */
+void ros_z_graph_free_topics_with_qos(struct ros_z_topic_info_with_qos_t *topics, uintptr_t count);
 
 /**
  * Get all node names and namespaces

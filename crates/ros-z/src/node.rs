@@ -625,10 +625,13 @@ impl ZNode {
     where
         F: Fn(&[u8]) + Send + Sync + 'static,
     {
+        use crate::ffi::subscriber::RawSubInner;
         use crate::{
             entity::{EndpointEntity, EntityKind},
             topic_name,
         };
+        use ros_z_protocol::qos::{QosDurability, QosHistory, QosReliability};
+        use zenoh_ext::{AdvancedSubscriberBuilderExt, HistoryConfig, RecoveryConfig};
 
         let qualified_topic =
             topic_name::qualify_topic_name(topic, &self.entity.namespace, &self.entity.name)
@@ -649,16 +652,53 @@ impl ZNode {
         };
 
         let topic_ke = self.keyexpr_format.topic_key_expr(&entity)?;
-        let subscriber = self
-            .session
-            .declare_subscriber((*topic_ke).clone())
-            .callback(move |sample| {
-                let payload = sample.payload().to_bytes();
-                callback(&payload);
-            })
-            .wait()?;
+        let key_expr = (*topic_ke).clone();
+        tracing::debug!(
+            "[FFI-SUB] Key expression: {}, qos={:?}",
+            key_expr, entity.qos
+        );
 
-        Ok(crate::ffi::subscriber::RawSubscriber { inner: subscriber })
+        let on_sample = move |sample: zenoh::sample::Sample| {
+            let payload = sample.payload().to_bytes();
+            callback(&payload);
+        };
+
+        // For TransientLocal durability we must declare an AdvancedSubscriber
+        // — that's the only subscriber type that interoperates with
+        // rmw_zenoh_cpp's AdvancedPublisher-with-cache. Options here mirror
+        // rmw_subscription_data.cpp:178-207 in rmw_zenoh.
+        let inner = match entity.qos.durability {
+            QosDurability::TransientLocal => {
+                tracing::debug!("[FFI-SUB] Durability: TransientLocal — AdvancedSubscriber");
+                let depth = match entity.qos.history {
+                    QosHistory::KeepLast(d) => d,
+                    QosHistory::KeepAll => 1,
+                };
+                let history = HistoryConfig::default()
+                    .detect_late_publishers()
+                    .max_samples(depth);
+                let mut adv = self
+                    .session
+                    .declare_subscriber(key_expr)
+                    .history(history)
+                    .callback(on_sample)
+                    .subscriber_detection();
+                if matches!(entity.qos.reliability, QosReliability::Reliable) {
+                    adv = adv.recovery(RecoveryConfig::default().heartbeat());
+                }
+                RawSubInner::Advanced(adv.wait()?)
+            }
+            QosDurability::Volatile => {
+                let sub = self
+                    .session
+                    .declare_subscriber(key_expr)
+                    .callback(on_sample)
+                    .wait()?;
+                RawSubInner::Plain(sub)
+            }
+        };
+
+        Ok(crate::ffi::subscriber::RawSubscriber { inner })
     }
 
     /// Create an action client for the given action name

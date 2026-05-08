@@ -11,6 +11,23 @@ pub struct CTopicInfo {
     pub type_name: *mut c_char,
 }
 
+/// Topic info plus the first observed publisher's QoS. QoS-related fields
+/// are only meaningful when `pub_count > 0`. Sentinel values (-1) indicate
+/// "no publisher observed". The QoS encoding mirrors `CQosProfile`:
+///   reliability: 0=Reliable, 1=BestEffort
+///   durability:  0=Volatile, 1=TransientLocal
+///   history:     0=KeepLast, 1=KeepAll
+#[repr(C)]
+pub struct CTopicInfoWithQos {
+    pub name: *mut c_char,
+    pub type_name: *mut c_char,
+    pub pub_count: i32,
+    pub pub_reliability: i32,
+    pub pub_durability: i32,
+    pub pub_history: i32,
+    pub pub_history_depth: i32,
+}
+
 /// Node info returned to FFI callers
 #[repr(C)]
 pub struct CNodeInfo {
@@ -76,6 +93,116 @@ pub unsafe extern "C" fn ros_z_graph_get_topic_names_and_types(
         *out_topics = ptr;
         *out_count = count;
         ErrorCode::Success as i32
+    }
+}
+
+/// Get all topic names and types, plus the first observed publisher's QoS.
+///
+/// # Safety
+/// `ctx` must be a valid context pointer. `out_topics` and `out_count` must be
+/// valid non-null pointers. The returned array must be freed with
+/// `ros_z_graph_free_topics_with_qos`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ros_z_graph_get_topics_with_publisher_qos(
+    ctx: *mut CContext,
+    out_topics: *mut *mut CTopicInfoWithQos,
+    out_count: *mut usize,
+) -> i32 {
+    use ros_z_protocol::qos::{QosDurability, QosHistory, QosReliability};
+
+    if out_topics.is_null() || out_count.is_null() {
+        return ErrorCode::NullPointer as i32;
+    }
+
+    unsafe {
+        let ctx_ref = match get_context_ref(ctx) {
+            Some(c) => c,
+            None => return ErrorCode::NullPointer as i32,
+        };
+
+        let topics = ctx_ref.graph().get_topics_with_publisher_qos();
+
+        let count = topics.len();
+        if count == 0 {
+            *out_topics = std::ptr::null_mut();
+            *out_count = 0;
+            return ErrorCode::Success as i32;
+        }
+
+        let layout = std::alloc::Layout::array::<CTopicInfoWithQos>(count).unwrap();
+        let ptr = std::alloc::alloc(layout) as *mut CTopicInfoWithQos;
+        if ptr.is_null() {
+            return ErrorCode::Unknown as i32;
+        }
+
+        for (i, (name, type_name, pub_qos, pub_count)) in topics.into_iter().enumerate() {
+            let c_name = CString::new(name).unwrap_or_default();
+            let c_type = CString::new(type_name).unwrap_or_default();
+            // Encode QoS using the same convention as CQosProfile (the
+            // input QoS struct), so callers can pass the discovered QoS
+            // back through the subscriber FFI without remapping.
+            let (rel, dur, hist, depth) = if let Some(q) = pub_qos {
+                let r = match q.reliability {
+                    QosReliability::Reliable => 0,
+                    QosReliability::BestEffort => 1,
+                };
+                let d = match q.durability {
+                    QosDurability::Volatile => 0,
+                    QosDurability::TransientLocal => 1,
+                };
+                let (h, depth) = match q.history {
+                    QosHistory::KeepLast(n) => (0, n as i32),
+                    QosHistory::KeepAll => (1, 0),
+                };
+                (r, d, h, depth)
+            } else {
+                (-1, -1, -1, 0)
+            };
+            std::ptr::write(
+                ptr.add(i),
+                CTopicInfoWithQos {
+                    name: c_name.into_raw(),
+                    type_name: c_type.into_raw(),
+                    pub_count: pub_count as i32,
+                    pub_reliability: rel,
+                    pub_durability: dur,
+                    pub_history: hist,
+                    pub_history_depth: depth,
+                },
+            );
+        }
+
+        *out_topics = ptr;
+        *out_count = count;
+        ErrorCode::Success as i32
+    }
+}
+
+/// Free topic-with-QoS info array
+///
+/// # Safety
+/// `topics` must be a pointer returned by
+/// `ros_z_graph_get_topics_with_publisher_qos`, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ros_z_graph_free_topics_with_qos(
+    topics: *mut CTopicInfoWithQos,
+    count: usize,
+) {
+    if topics.is_null() || count == 0 {
+        return;
+    }
+    unsafe {
+        for i in 0..count {
+            let topic = &*topics.add(i);
+            if !topic.name.is_null() {
+                let _ = CString::from_raw(topic.name);
+            }
+            if !topic.type_name.is_null() {
+                let _ = CString::from_raw(topic.type_name);
+            }
+        }
+        let layout = std::alloc::Layout::array::<CTopicInfoWithQos>(count).unwrap();
+        std::alloc::dealloc(topics as *mut u8, layout);
     }
 }
 

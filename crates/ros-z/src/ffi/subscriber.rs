@@ -3,13 +3,24 @@ use super::qos::CQosProfile;
 use super::{ErrorCode, cstr_to_str};
 use std::ffi::c_char;
 use zenoh::pubsub::Subscriber;
+use zenoh_ext::AdvancedSubscriber;
 
 /// Callback type for receiving messages
 pub type MessageCallback = extern "C" fn(user_data: usize, data: *const u8, len: usize);
 
+/// Inner subscriber holder. Volatile durability uses a plain Zenoh
+/// subscriber; TransientLocal uses an AdvancedSubscriber so we can
+/// interoperate with rmw_zenoh_cpp's AdvancedPublisher (history replay,
+/// late-publisher detection, heartbeat-based recovery).
+#[allow(dead_code)]
+pub enum RawSubInner {
+    Plain(Subscriber<()>),
+    Advanced(AdvancedSubscriber<()>),
+}
+
 /// Raw subscriber wrapper that keeps the zenoh subscriber alive
 pub struct RawSubscriber {
-    pub inner: Subscriber<()>,
+    pub inner: RawSubInner,
 }
 
 /// Opaque subscriber handle for FFI
@@ -62,6 +73,10 @@ pub unsafe extern "C" fn ros_z_subscriber_create_with_qos(
     user_data: usize,
     qos: *const CQosProfile,
 ) -> *mut CSubscriber {
+    // Unconditional entry log — proves the FFI was invoked regardless of any
+    // downstream branching. If you don't see this at all on subscribe, the
+    // running binary isn't linked against this build of libros_z.a.
+    tracing::info!("[FFI-SUB] ros_z_subscriber_create_with_qos called");
     unsafe {
         let node_ref = match get_node_ref(node) {
             Some(n) => n,

@@ -20,6 +20,18 @@ use crate::msg::{SerdeCdrSerdes, ZDeserializer, ZMessage, ZSerializer};
 use crate::qos::QosProfile;
 use ros_z_protocol::qos::{QosDurability, QosHistory, QosReliability};
 use std::sync::Mutex;
+// rmw_zenoh_cpp publishers wrap their plain publisher in a
+// `zenoh::ext::AdvancedPublisher` with a cache option for transient_local
+// durability (see rmw_zenoh_cpp/src/detail/rmw_publisher_data.cpp). The
+// legacy `PublicationCache` / `QueryingSubscriber` pair speaks a different
+// wire protocol and does NOT interoperate with `AdvancedPublisher`. So to
+// receive history (and live samples reliably) from rmw_zenoh publishers we
+// must declare a matching `AdvancedSubscriber` with `history` (and
+// `recovery::heartbeat` for reliable QoS) — the same options
+// rmw_zenoh_cpp's subscriber side uses in rmw_subscription_data.cpp.
+use zenoh_ext::{
+    AdvancedSubscriber, AdvancedSubscriberBuilderExt, HistoryConfig, RecoveryConfig,
+};
 
 /// A typed ROS 2-style publisher. Send messages with [`publish`](ZPub::publish)
 /// (synchronous) or [`async_publish`](ZPub::async_publish) (async).
@@ -794,18 +806,52 @@ where
             handler.handle(sample)
         };
 
-        let mut sub_builder = self
-            .session
-            .declare_subscriber(key_expr)
-            .callback(validated_handler);
-
-        // Apply locality restriction if specified
-        if let Some(locality) = self.locality {
-            sub_builder = sub_builder.allowed_origin(locality);
-            debug!("[SUB] Locality restriction: {:?}", locality);
-        }
-
-        let inner = sub_builder.wait()?;
+        // For TransientLocal durability, declare an AdvancedSubscriber that
+        // mirrors what rmw_zenoh_cpp does in rmw_subscription_data.cpp:
+        //
+        //   - history { detect_late_publishers, max_samples = qos.depth }
+        //   - subscriber_detection (so AdvancedPublishers can detect us)
+        //   - recovery::heartbeat for reliable QoS
+        //
+        // This is the only configuration that speaks the same wire protocol
+        // as rmw_zenoh's AdvancedPublisher-with-cache. Without it, the
+        // subscriber sees neither history replay nor (often) live samples
+        // on transient_local topics published by ROS 2 nodes via rmw_zenoh.
+        let inner = match self.entity.qos.durability {
+            QosDurability::TransientLocal => {
+                debug!("[SUB] Durability: TransientLocal — AdvancedSubscriber");
+                let depth = match self.entity.qos.history {
+                    QosHistory::KeepLast(d) => d,
+                    QosHistory::KeepAll => 1,
+                };
+                let history = HistoryConfig::default()
+                    .detect_late_publishers()
+                    .max_samples(depth);
+                let mut adv = self
+                    .session
+                    .declare_subscriber(key_expr)
+                    .history(history)
+                    .callback(validated_handler)
+                    .subscriber_detection();
+                if let Some(locality) = self.locality {
+                    adv = adv.allowed_origin(locality);
+                    debug!("[SUB] Locality restriction: {:?}", locality);
+                }
+                if matches!(self.entity.qos.reliability, QosReliability::Reliable) {
+                    adv = adv.recovery(RecoveryConfig::default().heartbeat());
+                }
+                SubInner::Advanced(adv.wait()?)
+            }
+            QosDurability::Volatile => {
+                let mut sub_builder =
+                    self.session.declare_subscriber(key_expr).callback(validated_handler);
+                if let Some(locality) = self.locality {
+                    sub_builder = sub_builder.allowed_origin(locality);
+                    debug!("[SUB] Locality restriction: {:?}", locality);
+                }
+                SubInner::Plain(sub_builder.wait()?)
+            }
+        };
 
         let gid = crate::entity::endpoint_gid(&self.entity);
         let lv_ke = self
@@ -932,10 +978,21 @@ where
     }
 }
 
+/// Holds whichever flavour of subscriber was built. Both variants drop
+/// cleanly — that's all this enum exists to do (we never read it back).
+/// `Plain` is the default (Volatile durability); `Advanced` is built when
+/// QoS durability is TransientLocal so we interoperate with rmw_zenoh's
+/// `AdvancedPublisher`-with-cache via the matching `AdvancedSubscriber`.
+#[allow(dead_code)]
+enum SubInner {
+    Plain(zenoh::pubsub::Subscriber<()>),
+    Advanced(AdvancedSubscriber<()>),
+}
+
 pub struct ZSub<T: ZMessage, Q, S: ZDeserializer> {
     pub entity: EndpointEntity,
     pub queue: Option<Arc<BoundedQueue<Q>>>,
-    _inner: zenoh::pubsub::Subscriber<()>,
+    _inner: SubInner,
     _lv_token: LivelinessToken,
     events_mgr: Arc<Mutex<EventsManager>>,
     graph: Arc<Graph>,

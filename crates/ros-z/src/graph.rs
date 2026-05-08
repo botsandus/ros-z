@@ -812,6 +812,58 @@ impl Graph {
         res
     }
 
+    /// Like [`get_topic_names_and_types`] but additionally returns the QoS
+    /// profile of the first observed publisher per topic, plus the total
+    /// publisher count. The QoS is `None` if no publishers are visible
+    /// (e.g. discovery snapshot before a publisher's liveliness token has
+    /// been observed). Aggregation across multiple publishers picks the
+    /// first one — sufficient for matching subscriber QoS in debug tooling.
+    pub fn get_topics_with_publisher_qos(
+        &self,
+    ) -> Vec<(String, String, Option<ros_z_protocol::qos::QosProfile>, usize)> {
+        let mut res = Vec::new();
+        let mut data = self.data.lock();
+
+        if !data.cached.is_empty() {
+            data.parse();
+        }
+
+        for (topic_name, slab) in &mut data.by_topic {
+            let mut found_type: Option<String> = None;
+            let mut first_pub_qos: Option<ros_z_protocol::qos::QosProfile> = None;
+            let mut pub_count: usize = 0;
+            slab.retain(|_, weak| {
+                if let Some(ent) = weak.upgrade() {
+                    if let Some(enp) = crate::entity::entity_get_endpoint(&ent) {
+                        if matches!(
+                            enp.kind,
+                            EntityKind::Publisher | EntityKind::Subscription
+                        ) && found_type.is_none()
+                            && let Some(type_info) = &enp.type_info
+                        {
+                            found_type = Some(type_info.name.clone());
+                        }
+                        if matches!(enp.kind, EntityKind::Publisher) {
+                            pub_count += 1;
+                            if first_pub_qos.is_none() {
+                                first_pub_qos = Some(enp.qos.clone());
+                            }
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            });
+
+            if let Some(type_name) = found_type {
+                res.push((topic_name.clone(), type_name, first_pub_qos, pub_count));
+            }
+        }
+
+        res
+    }
+
     pub fn get_topic_names_and_types(&self) -> Vec<(String, String)> {
         let mut res = Vec::new();
         let mut data = self.data.lock();

@@ -16,6 +16,25 @@ type TopicInfo struct {
 	TypeName string
 }
 
+// PublisherQoS describes the first observed publisher's QoS for a topic.
+// Empty / zero values indicate no publisher was visible at discovery time.
+type PublisherQoS struct {
+	Count        int            // number of publishers visible
+	Reliability  QosReliability // valid only when Count > 0
+	Durability   QosDurability
+	History      QosHistory
+	HistoryDepth int
+}
+
+// TopicInfoWithQoS pairs a discovered topic with the first observed
+// publisher's QoS. PublisherQoS.Count == 0 means no publisher was visible
+// at the time of the call (e.g. snapshot before liveliness propagated).
+type TopicInfoWithQoS struct {
+	Name      string
+	TypeName  string
+	Publisher PublisherQoS
+}
+
 // NodeInfo describes a discovered node
 type NodeInfo struct {
 	Name      string
@@ -49,6 +68,50 @@ func (c *Context) GetTopicNamesAndTypes() ([]TopicInfo, error) {
 			Name:     C.GoString(cSlice[i].name),
 			TypeName: C.GoString(cSlice[i].type_name),
 		}
+	}
+
+	return topics, nil
+}
+
+// GetTopicsWithPublisherQoS returns all topics in the ROS graph, paired
+// with the first observed publisher's QoS profile per topic.
+func (c *Context) GetTopicsWithPublisherQoS() ([]TopicInfoWithQoS, error) {
+	if c.handle == nil {
+		return nil, fmt.Errorf("context is closed")
+	}
+
+	var cTopics *C.ros_z_topic_info_with_qos_t
+	var count C.uintptr_t
+
+	result := C.ros_z_graph_get_topics_with_publisher_qos(c.handle, &cTopics, &count)
+	if result != 0 {
+		return nil, NewRoszError(ErrorCode(result), "failed to get topics with publisher qos")
+	}
+
+	n := int(count)
+	if n == 0 {
+		return nil, nil
+	}
+	defer C.ros_z_graph_free_topics_with_qos(cTopics, count)
+
+	topics := make([]TopicInfoWithQoS, n)
+	cSlice := unsafe.Slice(cTopics, n)
+	for i := 0; i < n; i++ {
+		t := cSlice[i]
+		ti := TopicInfoWithQoS{
+			Name:     C.GoString(t.name),
+			TypeName: C.GoString(t.type_name),
+		}
+		if t.pub_count > 0 {
+			ti.Publisher = PublisherQoS{
+				Count:        int(t.pub_count),
+				Reliability:  QosReliability(t.pub_reliability),
+				Durability:   QosDurability(t.pub_durability),
+				History:      QosHistory(t.pub_history),
+				HistoryDepth: int(t.pub_history_depth),
+			}
+		}
+		topics[i] = ti
 	}
 
 	return topics, nil
